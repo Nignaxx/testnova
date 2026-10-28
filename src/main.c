@@ -9,15 +9,18 @@
 #include <psp2/net/http.h>
 #include <psp2/net/net.h>
 #include <psp2/net/netctl.h>
+#include <psp2/power.h>
+#include <psp2/rtc.h>
 #include <psp2/sysmodule.h>
 #include <vita2d.h>
 #include <ctype.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 
-int _newlib_heap_size_user = 96 * 1024 * 1024;
+int _newlib_heap_size_user = 64 * 1024 * 1024;
 
 #define ROOT "ux0:data/NovaDeck"
 #define RETRO_CORES "ux0:app/RETROVITA"
@@ -61,8 +64,9 @@ static float fpos = 0, tabpos = 0;
 static vita2d_pgf *font;
 static unsigned old_btn = 0;
 static int net_ok = 0;
+static int fast = 0;
 
-static void txt(int x, int y, unsigned c, float s, const char *t) { vita2d_pgf_draw_text(font, x, y, c, s, t); }
+static void txt(int x, int y, unsigned c, float s, const char *t) { vita2d_pgf_draw_text(font, x, y, c, s, "%s", t); }
 static void txtc(int y, unsigned c, float s, const char *t) {
     int w = vita2d_pgf_text_width(font, s, t);
     txt((SW - w) / 2, y, c, s, t);
@@ -71,6 +75,37 @@ static void clipname(char *dst, const char *src, int max) {
     int n = (int)strlen(src);
     if (n <= max) { strcpy(dst, src); return; }
     memcpy(dst, src, max - 2); dst[max - 2] = '.'; dst[max - 1] = '.'; dst[max] = 0;
+}
+static unsigned bgcol(int y) {
+    int ys = (y / 8) * 8;
+    float t = ys / (float)SH;
+    return RGBA8((int)(22 - 16 * t), (int)(40 - 30 * t), (int)(92 - 64 * t), 255);
+}
+static void rrect(float x, float y, float w, float h, float r, unsigned col) {
+    if (r > h / 2) r = h / 2;
+    if (r > w / 2) r = w / 2;
+    vita2d_draw_rectangle(x + r, y, w - 2 * r, h, col);
+    vita2d_draw_rectangle(x, y + r, r, h - 2 * r, col);
+    vita2d_draw_rectangle(x + w - r, y + r, r, h - 2 * r, col);
+    vita2d_draw_fill_circle(x + r, y + r, r, col);
+    vita2d_draw_fill_circle(x + w - r, y + r, r, col);
+    vita2d_draw_fill_circle(x + r, y + h - r, r, col);
+    vita2d_draw_fill_circle(x + w - r, y + h - r, r, col);
+}
+// arrondit les coins d'une image : recouvre les angles avec la couleur du fond
+static void cornermask(float x, float y, float w, float h, int r, int usebg, unsigned col) {
+    for (int d = 0; d < r; d++) {
+        float dy = r - d - 0.5f;
+        float inset = r - sqrtf((float)r * r - dy * dy);
+        int iw = (int)(inset + 0.99f);
+        if (iw <= 0) continue;
+        unsigned ct = usebg ? bgcol((int)(y + d)) : col;
+        unsigned cb = usebg ? bgcol((int)(y + h - 1 - d)) : col;
+        vita2d_draw_rectangle(x, y + d, iw, 1, ct);
+        vita2d_draw_rectangle(x + w - iw, y + d, iw, 1, ct);
+        vita2d_draw_rectangle(x, y + h - 1 - d, iw, 1, cb);
+        vita2d_draw_rectangle(x + w - iw, y + h - 1 - d, iw, 1, cb);
+    }
 }
 static int exists(const char *p) { SceIoStat st; return sceIoGetstat(p, &st) >= 0; }
 static void mk(const char *p) { sceIoMkdir(p, 0777); }
@@ -132,14 +167,17 @@ static int ext_ok(const char *exts, const char *file) {
 static void scan(int c) {
     G[c] = calloc(MAXG, sizeof(Game));
     NG[c] = 0;
+    if (!G[c]) return;
     char dir[200];
     if (c == 0) snprintf(dir, sizeof dir, "ux0:app");
+    else if (c == 1) snprintf(dir, sizeof dir, "ux0:pspemu/ISO");
     else snprintf(dir, sizeof dir, ROOT "/roms/%s", C[c].dir);
     SceUID d = sceIoDopen(dir);
     if (d < 0) return;
     SceIoDirent e;
-    memset(&e, 0, sizeof e);
-    while (sceIoDread(d, &e) > 0 && NG[c] < MAXG) {
+    while (NG[c] < MAXG) {
+        memset(&e, 0, sizeof e);
+        if (sceIoDread(d, &e) <= 0) break;
         Game *g = &G[c][NG[c]];
         int isdir = SCE_S_ISDIR(e.d_stat.st_mode);
         if (c == 0) {
@@ -160,7 +198,7 @@ static void scan(int c) {
 }
 
 static void load_cov(Game *g) {
-    if (g->cov || g->nocov) return;
+    if (g->cov || g->nocov || fast) return;
     char p[300];
     if (ci == 0) snprintf(p, sizeof p, "ux0:app/%s/sce_sys/icon0.png", g->id);
     else cover_path(p, sizeof p, ci, g->name);
@@ -178,6 +216,37 @@ static void free_far(int c, int keep_from, int keep_to) {
 }
 
 // ---- dessin ----
+static void statusbar(void) {
+    static int tick = 0, pct = 100, chg = 0, wifi = 0;
+    if (tick++ % 30 == 0) {
+        pct = scePowerGetBatteryLifePercent();
+        chg = scePowerIsBatteryCharging();
+        int st = 0;
+        wifi = net_ok && sceNetCtlInetGetState(&st) >= 0 && st == SCE_NETCTL_STATE_CONNECTED;
+    }
+    SceDateTime t;
+    sceRtcGetCurrentClockLocalTime(&t);
+    char tm[16]; snprintf(tm, sizeof tm, "%02d:%02d", t.hour, t.minute);
+    unsigned fg = RGBA8(238, 242, 255, 255), dim = RGBA8(255, 255, 255, 60);
+    int tw = vita2d_pgf_text_width(font, 0.85f, tm);
+    int x = SW - 30 - tw;
+    txt(x, 515, fg, 0.85f, tm);
+    // batterie
+    x -= 16 + 32;
+    rrect(x, 502, 30, 14, 3, fg);
+    rrect(x + 2, 504, 26, 10, 2, RGBA8(20, 30, 60, 255));
+    int fw = (pct < 0 ? 0 : pct > 100 ? 100 : pct) * 22 / 100;
+    unsigned bc = chg ? RGBA8(76, 201, 240, 255) : pct <= 15 ? RGBA8(239, 68, 68, 255) : pct <= 35 ? RGBA8(245, 158, 11, 255) : RGBA8(74, 222, 128, 255);
+    if (fw > 0) vita2d_draw_rectangle(x + 4, 506, fw, 6, bc);
+    vita2d_draw_rectangle(x + 30, 506, 3, 6, fg);
+    char ps[8]; snprintf(ps, sizeof ps, "%d%%", pct);
+    int pw = vita2d_pgf_text_width(font, 0.7f, ps);
+    txt(x - 6 - pw, 514, fg, 0.7f, ps);
+    // wifi : 4 barres
+    int wx = x - 6 - pw - 16 - 22;
+    for (int i = 0; i < 4; i++) vita2d_draw_rectangle(wx + i * 6, 516 - (4 + i * 4), 4, 4 + i * 4, wifi ? fg : dim);
+}
+
 static void draw_scene(void) {
     for (int y = 0; y < SH; y += 8) {
         float t = y / (float)SH;
@@ -200,7 +269,7 @@ static void draw_scene(void) {
         float w = vita2d_pgf_text_width(font, 0.8f, C[i].id) + 30;
         if (acc + w > 0 && acc < SW) {
             int on = (i == ci);
-            vita2d_draw_rectangle(acc, 62, w, 34, on ? RGBA8(76, 201, 240, 255) : RGBA8(255, 255, 255, 28));
+            rrect(acc, 62, w, 34, 17, on ? RGBA8(76, 201, 240, 255) : RGBA8(255, 255, 255, 28));
             txt(acc + 15, 85, on ? RGBA8(4, 32, 43, 255) : RGBA8(139, 149, 184, 255), 0.8f, C[i].id);
         }
         acc += w + 8;
@@ -213,6 +282,7 @@ static void draw_scene(void) {
         txtc(250, RGBA8(238, 242, 255, 255), 1.0f, "Aucun jeu trouve");
         char hint[160];
         if (ci == 0) snprintf(hint, sizeof hint, "Installe des jeux Vita pour les voir ici");
+        else if (ci == 1) snprintf(hint, sizeof hint, "Mets tes ISO dans ux0:pspemu/ISO");
         else snprintf(hint, sizeof hint, "Mets tes ROM dans " ROOT "/roms/%s", C[ci].dir);
         txtc(285, RGBA8(139, 149, 184, 255), 0.8f, hint);
     }
@@ -220,7 +290,7 @@ static void draw_scene(void) {
         float x = SW / 2 - CW / 2 + (i - fpos) * (CW + GAP);
         if (x < -CW || x > SW) continue;
         Game *g = &G[ci][i];
-        if (i == gi) vita2d_draw_rectangle(x - 4, y0 - 4, CW + 8, CH + 8, RGBA8(76, 201, 240, 255));
+        if (i == gi) rrect(x - 4, y0 - 4, CW + 8, CH + 8, 16, RGBA8(76, 201, 240, 255));
         load_cov(g);
         if (g->cov) {
             vita2d_draw_texture_scale(g->cov, x, y0, CW / (float)vita2d_texture_get_width(g->cov), CH / (float)vita2d_texture_get_height(g->cov));
@@ -234,6 +304,7 @@ static void draw_scene(void) {
             txt(x + 8, y0 + CH - 12, RGBA8(255, 255, 255, 255), 0.7f, nm);
         }
         if (i != gi) vita2d_draw_rectangle(x, y0, CW, CH, RGBA8(0, 0, 0, 120));
+        cornermask(x, y0, CW, CH, 12, i != gi, RGBA8(76, 201, 240, 255));
     }
 
     // infos du jeu choisi
@@ -244,6 +315,7 @@ static void draw_scene(void) {
         txt(40, 458, RGBA8(139, 149, 184, 255), 0.85f, m);
     }
     txt(40, 515, RGBA8(139, 149, 184, 255), 0.75f, "L/R: console    X: lancer    Triangle: jaquettes    Start: quitter");
+    statusbar();
 }
 
 static void frame(const char *l1, const char *l2) {
@@ -311,6 +383,46 @@ static int http_get(const char *url, const char *dest) {
     return ok;
 }
 
+static int try_urls(int c, const char *name, int allkinds, const char *dest) {
+    char repo[200], sys[260], nm[400], url[1100];
+    int n = 0;
+    for (const char *p = C[c].thumb; *p && n < 190; p++) repo[n++] = (*p == ' ') ? '_' : *p;
+    repo[n] = 0;
+    urlenc(sys, sizeof sys, C[c].thumb);
+    urlenc(nm, sizeof nm, name);
+    const char *kinds[] = {"Named_Boxarts", "Named_Titles", "Named_Snaps"};
+    int nk = allkinds ? 3 : 1;
+    for (int k = 0; k < nk; k++) {
+        // source 1 : serveur de vignettes libretro
+        snprintf(url, sizeof url, "https://thumbnails.libretro.com/%s/%s/%s.png", sys, kinds[k], nm);
+        if (http_get(url, dest)) return 1;
+        // source 2 : depots GitHub libretro-thumbnails
+        snprintf(url, sizeof url, "https://raw.githubusercontent.com/libretro-thumbnails/%s/master/%s/%s.png", repo, kinds[k], nm);
+        if (http_get(url, dest)) return 1;
+    }
+    return 0;
+}
+
+static int fetch_cover(int c, const char *name, const char *dest) {
+    if (try_urls(c, name, 1, dest)) return 1;
+    // essaie le nom sans les tags, puis avec des tags de region courants
+    char base[100];
+    snprintf(base, sizeof base, "%s", name);
+    char *p = strchr(base, '('); if (p) *p = 0;
+    p = strchr(base, '['); if (p) *p = 0;
+    int l = (int)strlen(base);
+    while (l > 0 && base[l - 1] == ' ') base[--l] = 0;
+    if (l == 0) return 0;
+    const char *tags[] = {"", " (USA)", " (Europe)", " (USA, Europe)", " (World)", " (Japan)"};
+    char cand[160];
+    for (int i = 0; i < 6; i++) {
+        snprintf(cand, sizeof cand, "%s%s", base, tags[i]);
+        if (!strcmp(cand, name)) continue;
+        if (try_urls(c, cand, 0, dest)) return 1;
+    }
+    return 0;
+}
+
 static void scrape(int c) {
     if (c == 0) { msg("Les jeux Vita utilisent leur propre icone", "Pas de scraping necessaire"); return; }
     int st = 0;
@@ -331,12 +443,8 @@ static void scrape(int c) {
         urlenc(sys, sizeof sys, C[c].thumb);
         // le nom doit correspondre au nom No-Intro de la base libretro
         urlenc(nm, sizeof nm, g->name);
-        const char *kinds[] = {"Named_Boxarts", "Named_Titles"};
-        int got = 0;
-        for (int k = 0; k < 2 && !got; k++) {
-            snprintf(url, sizeof url, "https://thumbnails.libretro.com/%s/%s/%s.png", sys, kinds[k], nm);
-            got = http_get(url, dest);
-        }
+        (void)url;
+        int got = fetch_cover(c, g->name, dest);
         if (got) { ok++; if (g->cov) { vita2d_wait_rendering_done(); vita2d_free_texture(g->cov); g->cov = NULL; } g->nocov = 0; }
         else ko++;
     }
@@ -347,9 +455,11 @@ static void scrape(int c) {
 // ---- lancement ----
 static void launch(const Game *g) {
     char uri[900];
+    const char *ext = strrchr(g->path, '.');
+    int pbp = ext && !strcasecmp(ext, ".pbp");
     if (ci == 0) snprintf(uri, sizeof uri, "psgm:play?titleid=%s", g->id);
-    else if (ci == 1) snprintf(uri, sizeof uri, "psgm:play?titleid=PSPEMUCFW");
-    else snprintf(uri, sizeof uri, "psgm:play?titleid=RETROVITA&param=%s/%s_libretro.self&param2=%s", RETRO_CORES, C[ci].core, g->path);
+    else if (ci == 1 || (ci == 2 && pbp)) snprintf(uri, sizeof uri, "psgm:play?titleid=PSPEMUCFW");
+    else snprintf(uri, sizeof uri, "psgm:play?titleid=RETROVITA&param=app0:%s_libretro.self&param2=%s", C[ci].core, g->path);
     sceAppMgrLaunchAppByUri(0xFFFFF, uri);
     sceKernelDelayThread(10000);
     sceAppMgrLaunchAppByUri(0xFFFFF, uri);
@@ -370,7 +480,7 @@ int main(void) {
     setup_dirs();
     for (int i = 0; i < NC; i++) scan(i);
     net_init();
-    int hold = 0;
+    int hold = 0, lr = 0;
     while (1) {
         SceCtrlData pad;
         sceCtrlPeekBufferPositive(0, &pad, 1);
@@ -382,8 +492,10 @@ int main(void) {
             if (++hold > 18 && hold % 4 == 0) mv = (pad.buttons & SCE_CTRL_LEFT) ? -1 : 1;
         } else hold = 0;
         if (mv && NG[ci] > 0) { gi += mv; if (gi < 0) gi = 0; if (gi >= NG[ci]) gi = NG[ci] - 1; }
-        if (pr & SCE_CTRL_LTRIGGER) switch_console(-1);
-        if (pr & SCE_CTRL_RTRIGGER) switch_console(1);
+        int hs = (pad.buttons & SCE_CTRL_LTRIGGER) ? -1 : ((pad.buttons & SCE_CTRL_RTRIGGER) ? 1 : 0);
+        if (hs) { lr++; if (lr == 1 || (lr > 18 && lr % 6 == 0)) switch_console(hs); }
+        else lr = 0;
+        fast = lr > 18;
         if ((pr & SCE_CTRL_CROSS) && NG[ci] > 0) launch(&G[ci][gi]);
         if (pr & SCE_CTRL_TRIANGLE) { scrape(ci); old_btn = 0; }
         if (pr & SCE_CTRL_START) break;
