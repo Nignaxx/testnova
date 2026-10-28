@@ -285,7 +285,7 @@ static void urlenc(char *o, int n, const char *s) {
 static int http_get(const char *url, const char *dest) {
     int tpl = sceHttpCreateTemplate("NovaDeck/1.0", SCE_HTTP_VERSION_1_1, 1);
     if (tpl < 0) return 0;
-    sceHttpsDisableOption(tpl, SCE_HTTPS_FLAG_SERVER_VERIFY);
+    sceHttpsDisableOption(SCE_HTTPS_FLAG_SERVER_VERIFY);
     sceHttpSetAutoRedirect(tpl, 1);
     int ok = 0;
     int conn = sceHttpCreateConnectionWithURL(tpl, url, 0);
