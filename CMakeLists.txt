@@ -24,7 +24,7 @@ target_link_libraries(${PROJECT_NAME}
   SceNet_stub SceNetCtl_stub SceHttp_stub SceLibKernel_stub
 )
 
-vita_create_self(eboot.bin ${PROJECT_NAME} UNSAFE)
+vita_create_self(eboot.bin ${PROJECT_NAME})
 vita_create_vpk(${PROJECT_NAME}.vpk ${VITA_TITLEID} eboot.bin
   VERSION ${VITA_VERSION}
   NAME ${VITA_APP_NAME}
