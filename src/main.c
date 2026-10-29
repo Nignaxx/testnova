@@ -66,7 +66,7 @@ static unsigned old_btn = 0;
 static int net_ok = 0;
 static int fast = 0;
 
-static void txt(int x, int y, unsigned c, float s, const char *t) { vita2d_pgf_draw_text(font, x, y, c, s, "%s", t); }
+static void txt(int x, int y, unsigned c, float s, const char *t) { vita2d_pgf_draw_text(font, x, y, c, s, t); }
 static void txtc(int y, unsigned c, float s, const char *t) {
     int w = vita2d_pgf_text_width(font, s, t);
     txt((SW - w) / 2, y, c, s, t);
